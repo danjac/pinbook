@@ -1,0 +1,11 @@
+bower_components
+public
+build
+node_modules
+uploads
+*.sqlite3
+*.swp
+*.swo
+*.db
+.env
+:w
