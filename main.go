@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"strconv"
 	//validator "github.com/asaskevich/govalidator"
 	"github.com/codegangsta/negroni"
 	"github.com/goincremental/negroni-sessions"
@@ -16,7 +17,6 @@ import (
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 	"html/template"
-	"log"
 	"net/http"
 	"os"
 	"path"
@@ -24,8 +24,11 @@ import (
 	"time"
 )
 
-const StaticDir = "/home/danjac/Projects/react-tutorial/public"
-const UploadsDir = "/home/danjac/Projects/react-tutorial/uploads"
+const (
+	StaticDir  = "/home/danjac/Projects/react-tutorial/public"
+	UploadsDir = "/home/danjac/Projects/react-tutorial/uploads"
+	PageSize   = 6
+)
 
 type Database struct {
 	*mgo.Database
@@ -73,29 +76,105 @@ type PostForm struct {
 	Comment string `json:"comment"`
 }
 
-type Result struct {
+type Pagination struct {
 	Posts   []Post `json:"posts"`
 	Total   int    `json:"total"`
 	IsFirst bool   `json:"isFirst"`
 	IsLast  bool   `json:"isLast"`
 	Page    int    `json:"page"`
+	Skip    int    `json:"-"`
+}
+
+func NewPagination(page int, total int) *Pagination {
+
+	numPages := (total / PageSize)
+	skip := (page - 1) * PageSize
+
+	return &Pagination{
+		Total:   total,
+		IsFirst: page == 1,
+		IsLast:  page == numPages,
+		Page:    page,
+		Skip:    skip,
+	}
+
 }
 
 type Context struct {
-	DB   *Database
-	User *User
+	DB       *Database
+	User     *User
+	Request  *http.Request
+	Response http.ResponseWriter
 }
 
-type handlerFunc func(*Context, http.ResponseWriter, *http.Request) error
+func (c *Context) GetObjectId(name string) bson.ObjectId {
+	return bson.ObjectIdHex(mux.Vars(c.Request)[name])
+}
+
+func (c *Context) GetUser() error {
+
+	c.User = nil
+
+	session := sessions.GetSession(c.Request)
+	userId := session.Get("userid")
+
+	if userId == nil {
+		return nil
+	}
+
+	user := &User{}
+
+	if err := c.DB.Users.Find(bson.M{"_id": bson.ObjectIdHex(userId.(string))}).One(&user); err != nil {
+		return nil
+	}
+
+	c.User = user
+	return nil
+
+}
+
+func (c *Context) Query(name string) string {
+	return c.Request.URL.Query().Get(name)
+}
+
+func (c *Context) Param(name string) string {
+	return mux.Vars(c.Request)[name]
+}
+
+func (c *Context) ParseJSON(payload interface{}) error {
+	return json.NewDecoder(c.Request.Body).Decode(payload)
+}
+
+func (c *Context) RenderJSON(payload interface{}, status int) error {
+	c.Response.Header().Set("Content-Type", "application/json")
+	c.Response.WriteHeader(status)
+	return json.NewEncoder(c.Response).Encode(payload)
+}
+
+func (c *Context) GetSession() sessions.Session {
+	return sessions.GetSession(c.Request)
+}
+
+func (c *Context) Error(msg string, status int) {
+	http.Error(c.Response, msg, status)
+}
+
+func NewContext(db *Database, w http.ResponseWriter, r *http.Request) *Context {
+	c := &Context{}
+	c.DB = db
+	c.Request = r
+	c.Response = w
+	return c
+}
+
+type handlerFunc func(*Context) error
 
 func makeHandler(db *Database, h handlerFunc) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		c := &Context{}
-		c.DB = db
-
-		err := h(c, w, r)
+		c := NewContext(db, w, r)
+		err := h(c)
 		if err != nil {
 			// http error handling here...
 			panic(err)
@@ -108,18 +187,17 @@ func makeSecureHandler(db *Database, h handlerFunc) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		c := &Context{}
-		c.DB = db
-		user, err := getUser(c, r)
+		c := NewContext(db, w, r)
+
+		err := c.GetUser()
 		if err != nil {
 			panic(err)
 		}
-		if user == nil {
+		if c.User == nil {
 			http.Error(w, "You must be logged in", http.StatusUnauthorized)
 			return
 		}
-		c.User = user
-		err = h(c, w, r)
+		err = h(c)
 		if err != nil {
 			panic(err)
 		}
@@ -127,69 +205,40 @@ func makeSecureHandler(db *Database, h handlerFunc) http.HandlerFunc {
 
 }
 
-func getUser(c *Context, r *http.Request) (*User, error) {
-
-	session := sessions.GetSession(r)
-	userId := session.Get("userid")
-
-	if userId == nil {
-		return nil, nil
-	}
-
-	user := &User{}
-
-	if err := c.DB.Users.Find(bson.M{"_id": bson.ObjectIdHex(userId.(string))}).One(&user); err != nil {
-		return nil, nil
-	}
-	return user, nil
-
-}
-
-func logout(c *Context, w http.ResponseWriter, r *http.Request) error {
-	session := sessions.GetSession(r)
+func logoutHandler(c *Context) error {
+	session := c.GetSession()
 	session.Clear()
-	http.Redirect(w, r, "/", 302)
+	http.Redirect(c.Response, c.Request, "/", 302)
 	return nil
 }
 
-func indexPage(c *Context, w http.ResponseWriter, r *http.Request) error {
+func indexPageHandler(c *Context) error {
 	t, err := template.ParseFiles("templates/index.html")
 	if err != nil {
 		return err
 	}
-	user, err := getUser(c, r)
-	if err != nil {
+	if err := c.GetUser(); err != nil {
 		return err
 	}
-	userJson, err := json.Marshal(user)
+	userJson, err := json.Marshal(c.User)
 	if err != nil {
 		return err
 	}
 	// get csrf token, user
 	ctx := make(map[string]interface{})
-	ctx["csrfToken"] = nosurf.Token(r)
+	ctx["csrfToken"] = nosurf.Token(c.Request)
 	ctx["user"] = template.JS(userJson)
-	return t.Execute(w, ctx)
+	return t.Execute(c.Response, ctx)
 }
 
-func parseJSON(payload interface{}, r *http.Request) error {
-	return json.NewDecoder(r.Body).Decode(payload)
-}
-
-func renderJSON(payload interface{}, status int, w http.ResponseWriter) error {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	return json.NewEncoder(w).Encode(payload)
-}
-
-func loginHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
+func loginHandler(c *Context) error {
 
 	s := &struct {
 		Identity string `json:"identity"`
 		Password string `json:"password"`
 	}{}
 
-	if err := parseJSON(s, r); err != nil {
+	if err := c.ParseJSON(s); err != nil {
 		return err
 	}
 
@@ -198,26 +247,57 @@ func loginHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
 	if err := c.DB.Users.Find(bson.M{"name": s.Identity}).One(&user); err != nil {
 		return err
 	}
-	session := sessions.GetSession(r)
+	session := c.GetSession()
 	session.Set("userid", user.Id.Hex())
 
-	return renderJSON(user, http.StatusOK, w)
+	return c.RenderJSON(user, http.StatusOK)
 
 }
 
-func deletePostHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
+func voteHandler(score int, c *Context) error {
 
-	postId := mux.Vars(r)["id"]
-	if postId == "" {
-		http.NotFound(w, r)
-		return nil
-	}
+	query := []bson.M{
+		bson.M{"_id": c.GetObjectId("id")},
+		bson.M{"$not": bson.M{"author": c.User.Id}},
+		bson.M{"$not": bson.M{"$in": bson.M{"_id": c.User.Votes}}}}
 
 	post := &Post{}
-	query := bson.M{"_id": bson.ObjectIdHex(postId), "author": c.User.Id}
 
 	if err := c.DB.Posts.Find(query).One(&post); err != nil {
-		http.NotFound(w, r)
+		return err
+	}
+
+	if err := c.DB.Posts.UpdateId(post.Id, bson.M{"$inc": bson.M{"score": score}}); err != nil {
+		return err
+	}
+
+	if err := c.DB.Users.UpdateId(post.AuthorId, bson.M{"$inc": bson.M{"totalScore": score}}); err != nil {
+		return err
+	}
+
+	if err := c.DB.Users.UpdateId(c.User.Id, bson.M{"votes": append(c.User.Votes, post.Id)}); err != nil {
+		return err
+	}
+
+	c.Response.WriteHeader(204)
+	return nil
+}
+
+func downvoteHandler(c *Context) error {
+	return voteHandler(-1, c)
+}
+
+func upvoteHandler(c *Context) error {
+	return voteHandler(-1, c)
+}
+
+func deletePostHandler(c *Context) error {
+
+	post := &Post{}
+	query := bson.M{"_id": c.GetObjectId("id"), "author": c.User.Id}
+
+	if err := c.DB.Posts.Find(query).One(&post); err != nil {
+		http.NotFound(c.Response, c.Request)
 		return nil
 	}
 
@@ -229,15 +309,15 @@ func deletePostHandler(c *Context, w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	c.Response.WriteHeader(http.StatusNoContent)
 	return nil
 }
 
-func submitPostHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
+func submitPostHandler(c *Context) error {
 
 	form := &PostForm{}
 
-	if err := parseJSON(form, r); err != nil {
+	if err := c.ParseJSON(form); err != nil {
 		return err
 	}
 
@@ -253,7 +333,7 @@ func submitPostHandler(c *Context, w http.ResponseWriter, r *http.Request) error
 
 	resp, err := http.Get(form.Image)
 	if err != nil {
-		http.Error(w, "Unable to fetch image", 400)
+		c.Error("Unable to fetch image", 400)
 		return nil
 	}
 	defer resp.Body.Close()
@@ -268,12 +348,12 @@ func submitPostHandler(c *Context, w http.ResponseWriter, r *http.Request) error
 	case ".png":
 		img, err = png.Decode(resp.Body)
 	default:
-		http.Error(w, "Not a valid image", 400)
+		c.Error("Not a valid image", 400)
 		return nil
 	}
 
 	if err != nil {
-		http.Error(w, "Unable to process", 400)
+		c.Error("Unable to process", 400)
 		return nil
 	}
 
@@ -296,7 +376,7 @@ func submitPostHandler(c *Context, w http.ResponseWriter, r *http.Request) error
 	case ".png":
 		png.Encode(out, t)
 	default:
-		http.Error(w, "Not a valid image", 400)
+		c.Error("Not a valid image", 400)
 		return nil
 	}
 
@@ -315,28 +395,24 @@ func submitPostHandler(c *Context, w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 
-	if err := c.DB.Users.Update(bson.M{"_id": c.User.Id}, bson.M{"$inc": bson.M{"totalScore": 1}}); err != nil {
+	if err := c.DB.Users.UpdateId(c.User.Id, bson.M{"$inc": bson.M{"totalScore": 1}}); err != nil {
 		return err
 	}
 
-	return renderJSON(post, http.StatusOK, w)
+	return c.RenderJSON(post, http.StatusOK)
 }
 
-func userHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
+func userHandler(c *Context) error {
 	var posts []Post
 
-	orderBy := r.URL.Query().Get("orderBy")
+	orderBy := c.Query("orderBy")
 	if orderBy != "created" && orderBy != "score" {
 		orderBy = "created"
 	}
 
-	//page := r.URL.Query["page"]
-
-	name := mux.Vars(r)["name"]
-
 	user := &Author{}
 
-	err := c.DB.Users.Find(bson.M{"name": name}).One(&user)
+	err := c.DB.Users.Find(bson.M{"name": c.Param("name")}).One(&user)
 
 	q := c.DB.Posts.Find(bson.M{"author": user.Id})
 
@@ -346,17 +422,18 @@ func userHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	err = q.Sort("-" + orderBy).Limit(12).All(&posts)
+	page, err := strconv.Atoi(c.Query("orderBy"))
+
+	if err != nil {
+		page = 1
+	}
+
+	result := NewPagination(page, total)
+
+	err = q.Sort("-" + orderBy).Skip(result.Skip).Limit(12).All(&posts)
 
 	if err != nil {
 		return err
-	}
-
-	result := &Result{
-		Total:   total,
-		IsFirst: true,
-		IsLast:  true,
-		Page:    1,
 	}
 
 	for _, post := range posts {
@@ -364,21 +441,20 @@ func userHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
 		result.Posts = append(result.Posts, post)
 	}
 
-	return renderJSON(result, http.StatusOK, w)
+	return c.RenderJSON(result, http.StatusOK)
 
 }
 
-func searchHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
+func searchHandler(c *Context) error {
 	var posts []Post
 
-	orderBy := r.URL.Query().Get("orderBy")
+	orderBy := c.Query("orderBy")
 	if orderBy != "created" && orderBy != "score" {
 		orderBy = "created"
 	}
 
 	//page := r.URL.Query["page"]
-	search := bson.M{"$regex": bson.RegEx{r.URL.Query().Get("q"), "i"}}
-	log.Print(search)
+	search := bson.M{"$regex": bson.RegEx{c.Query("q"), "i"}}
 
 	q := c.DB.Posts.Find(bson.M{"$or": []bson.M{bson.M{"title": search}, bson.M{"url": search}}})
 
@@ -393,13 +469,13 @@ func searchHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	page, err := strconv.Atoi(c.Query("page"))
 
-	result := &Result{
-		Total:   total,
-		IsFirst: true,
-		IsLast:  true,
-		Page:    1,
+	if err != nil {
+		page = 1
 	}
+
+	result := NewPagination(page, total)
 
 	for _, post := range posts {
 		err = c.DB.Users.Find(
@@ -412,37 +488,35 @@ func searchHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
 		result.Posts = append(result.Posts, post)
 	}
 
-	return renderJSON(result, http.StatusOK, w)
+	return c.RenderJSON(result, http.StatusOK)
 
 }
 
-func postsHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
+func postsHandler(c *Context) error {
 
 	var posts []Post
 
-	orderBy := r.URL.Query().Get("orderBy")
+	orderBy := c.Query("orderBy")
 	if orderBy != "created" && orderBy != "score" {
 		orderBy = "created"
 	}
-
-	//page := r.URL.Query["page"]
 
 	total, err := c.DB.Posts.Count()
 	if err != nil {
 		return err
 	}
+	page, err := strconv.Atoi(c.Query("page"))
 
-	err = c.DB.Posts.Find(nil).Sort("-" + orderBy).Limit(12).All(&posts)
+	if err != nil {
+		page = 1
+	}
+
+	result := NewPagination(page, total)
+
+	err = c.DB.Posts.Find(nil).Sort("-" + orderBy).Skip(result.Skip).Limit(12).All(&posts)
 
 	if err != nil {
 		return err
-	}
-
-	result := &Result{
-		Total:   total,
-		IsFirst: true,
-		IsLast:  true,
-		Page:    1,
 	}
 
 	for _, post := range posts {
@@ -456,7 +530,7 @@ func postsHandler(c *Context, w http.ResponseWriter, r *http.Request) error {
 		result.Posts = append(result.Posts, post)
 	}
 
-	return renderJSON(result, http.StatusOK, w)
+	return c.RenderJSON(result, http.StatusOK)
 }
 
 func serveStatic(router *mux.Router, prefix string, dirname string) {
@@ -479,6 +553,8 @@ func getRouter(db *Database) *mux.Router {
 
 	secure := api.PathPrefix("/auth/").Subrouter()
 	secure.HandleFunc("/submit/", makeSecureHandler(db, submitPostHandler)).Methods("POST")
+	secure.HandleFunc("/downvote/{id}", makeSecureHandler(db, downvoteHandler)).Methods("PUT")
+	secure.HandleFunc("/upvote/{id}", makeSecureHandler(db, upvoteHandler)).Methods("PUT")
 	secure.HandleFunc("/{id}", makeSecureHandler(db, deletePostHandler)).Methods("DELETE")
 
 	// public files
@@ -489,8 +565,8 @@ func getRouter(db *Database) *mux.Router {
 	// main page
 
 	main := router.PathPrefix("/").Subrouter()
-	main.HandleFunc("/logout/", makeHandler(db, logout)).Methods("GET")
-	main.HandleFunc(`/{rest:[a-zA-Z0-9=\-\/]*}`, makeHandler(db, indexPage)).Methods("GET")
+	main.HandleFunc("/logout/", makeHandler(db, logoutHandler)).Methods("GET")
+	main.HandleFunc(`/{rest:[a-zA-Z0-9=\-\/]*}`, makeHandler(db, indexPageHandler)).Methods("GET")
 
 	return router
 
