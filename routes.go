@@ -3,6 +3,7 @@ package pinbook
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/asaskevich/govalidator"
 	"github.com/gorilla/mux"
 	"github.com/justinas/nosurf"
 	"github.com/nfnt/resize"
@@ -15,18 +16,17 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 )
 
-const (
-	PageSize = 6
-)
+const PageSize = 6
 
 type PostForm struct {
-	Title   string `json:"title"`
-	URL     string `json:"url" valid:"url"`
-	Image   string `json:"image" valid:"url"`
-	Comment string `json:"comment"`
+	Title   string `json:"title" valid:"required"`
+	URL     string `json:"url" valid:"url,required"`
+	Image   string `json:"image" valid:"image,required"`
+	Comment string `json:"comment" valid:"-"`
 }
 
 type Pagination struct {
@@ -207,13 +207,10 @@ func submitPostHandler(c *Context) error {
 		return err
 	}
 
-	/*
-		_, err = validator.ValidateStruct(form)
-		if err != nil {
-			log.Print(err)
-			return renderJSON(err, 400, w)
-		}
-	*/
+	_, err := govalidator.ValidateStruct(form)
+	if err != nil {
+		return c.RenderJSON(err, 400)
+	}
 
 	// fetch image
 
@@ -421,6 +418,38 @@ func postsHandler(c *Context) error {
 
 func serveStatic(router *mux.Router, prefix string, dirname string) {
 	router.PathPrefix(prefix).Handler(http.StripPrefix(prefix, http.FileServer(http.Dir(dirname))))
+}
+
+func addValidators(app *App) {
+	govalidator.TagMap["image"] = govalidator.Validator(func(str string) bool {
+		ext := strings.ToLower(path.Ext(str))
+		if ext == "" {
+			return false
+		}
+		for _, s := range []string{".png", ".jpg"} {
+			if s == ext {
+				return true
+			}
+		}
+		return false
+	})
+
+	govalidator.TagMap["uniqueEmail"] = govalidator.Validator(func(str string) bool {
+		if str == "" {
+			return true
+		}
+		num, _ := app.DB.Users.Find(bson.M{"email": str}).Count()
+		return num == 0
+	})
+
+	govalidator.TagMap["uniqueName"] = govalidator.Validator(func(str string) bool {
+		if str == "" {
+			return true
+		}
+		num, _ := app.DB.Users.Find(bson.M{"name": str}).Count()
+		return num == 0
+	})
+
 }
 
 func getRouter(app *App) *mux.Router {

@@ -38,6 +38,8 @@ func ServeApp(cfg *Config) error {
 	app.DB = NewDatabase(session.DB(cfg.DbName))
 	app.Cfg = cfg
 
+	addValidators(app)
+
 	router := getRouter(app)
 
 	n := negroni.Classic()
