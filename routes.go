@@ -98,7 +98,7 @@ func indexPageHandler(c *Context) error {
 		return err
 	}
 	// get csrf token, user
-	ctx := make(map[string]interface{})
+	ctx := make(TemplateContext)
 	ctx["csrfToken"] = nosurf.Token(c.Request)
 	ctx["user"] = template.JS(userJson)
 	return c.Render("templates/index.html", ctx, http.StatusOK)

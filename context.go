@@ -10,6 +10,8 @@ import (
 	"net/http"
 )
 
+type TemplateContext map[string]interface{}
+
 type Context struct {
 	*App
 	User     *User
@@ -114,7 +116,7 @@ func (c *Context) String(msg string, status int) {
 	c.Response.Write([]byte(msg))
 }
 
-func (c *Context) Render(name string, ctx interface{}, status int) error {
+func (c *Context) Render(name string, ctx TemplateContext, status int) error {
 	t, err := template.ParseFiles(name)
 	if err != nil {
 		return err
