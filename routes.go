@@ -168,7 +168,7 @@ func deletePostHandler(c *Context) error {
 	query := bson.M{"_id": c.GetObjectId("id"), "author": c.User.Id}
 
 	if err := c.DB.Posts.Find(query).One(&post); err != nil {
-		http.NotFound(c.Response, c.Request)
+		c.NotFound()
 		return nil
 	}
 

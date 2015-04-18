@@ -128,9 +128,13 @@ func (c *Context) Status(status int) {
 	c.String(http.StatusText(status), status)
 }
 
+func (c *Context) NotFound() {
+	http.NotFound(c.Response, c.Request)
+}
+
 func (c *Context) HandleError(err error) {
-	c.Status(http.StatusInternalServerError)
 	log.Print(err)
+	c.Status(http.StatusInternalServerError)
 }
 
 func (c *Context) GetSession() sessions.Session {
