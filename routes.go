@@ -55,10 +55,11 @@ func makeHandler(app *App, h handlerFunc, authRequired bool) httprouter.Handle {
 
 		if authRequired {
 			if err := c.GetUser(); err != nil {
-				panic(err)
+				c.HandleError(err)
+				return
 			}
 			if c.User == nil {
-				c.Response.WriteHeader(401)
+				c.Status(http.StatusUnauthorized)
 				return
 			}
 		}
@@ -75,7 +76,7 @@ func makeHandler(app *App, h handlerFunc, authRequired bool) httprouter.Handle {
 				c.JSON(e.Errors, http.StatusBadRequest)
 				return
 			default:
-				panic(e)
+				c.HandleError(e)
 			}
 		}
 	}
@@ -85,15 +86,11 @@ func makeHandler(app *App, h handlerFunc, authRequired bool) httprouter.Handle {
 func logoutHandler(c *Context) error {
 	session := c.GetSession()
 	session.Clear()
-	http.Redirect(c.Response, c.Request, "/", 302)
+	http.Redirect(c.Response, c.Request, "/", http.StatusSeeOther)
 	return nil
 }
 
 func indexPageHandler(c *Context) error {
-	t, err := template.ParseFiles("templates/index.html")
-	if err != nil {
-		return err
-	}
 	if err := c.GetUser(); err != nil {
 		return err
 	}
@@ -105,7 +102,7 @@ func indexPageHandler(c *Context) error {
 	ctx := make(map[string]interface{})
 	ctx["csrfToken"] = nosurf.Token(c.Request)
 	ctx["user"] = template.JS(userJson)
-	return t.Execute(c.Response, ctx)
+	return c.Render("templates/index.html", ctx, http.StatusOK)
 }
 
 func loginHandler(c *Context) error {
@@ -124,9 +121,7 @@ func loginHandler(c *Context) error {
 	if err := c.DB.Users.Find(bson.M{"name": s.Identity}).One(&user); err != nil {
 		return err
 	}
-	session := c.GetSession()
-	session.Set("userid", user.Id.Hex())
-
+	c.Login(user)
 	return c.JSON(user, http.StatusOK)
 
 }
@@ -156,7 +151,7 @@ func voteHandler(score int, c *Context) error {
 		return err
 	}
 
-	c.Response.WriteHeader(204)
+	c.Status(http.StatusNoContent)
 	return nil
 }
 
@@ -186,7 +181,7 @@ func deletePostHandler(c *Context) error {
 		return err
 	}
 
-	c.Response.WriteHeader(http.StatusNoContent)
+	c.Status(http.StatusNoContent)
 	return nil
 }
 
@@ -202,7 +197,7 @@ func submitPostHandler(c *Context) error {
 
 	resp, err := http.Get(form.Image)
 	if err != nil {
-		c.Error("Unable to fetch image", 400)
+		c.String("Unable to find image", http.StatusBadRequest)
 		return nil
 	}
 	defer resp.Body.Close()
@@ -217,12 +212,12 @@ func submitPostHandler(c *Context) error {
 	case ".png":
 		img, err = png.Decode(resp.Body)
 	default:
-		c.Error("Not a valid image", 400)
+		c.String("Not a valid image", http.StatusBadRequest)
 		return nil
 	}
 
 	if err != nil {
-		c.Error("Unable to process", 400)
+		c.String("Unable to process image", http.StatusBadRequest)
 		return nil
 	}
 
@@ -245,7 +240,7 @@ func submitPostHandler(c *Context) error {
 	case ".png":
 		png.Encode(out, t)
 	default:
-		c.Error("Not a valid image", 400)
+		c.String("Not a valid image", http.StatusBadRequest)
 		return nil
 	}
 
@@ -315,12 +310,12 @@ func userHandler(c *Context) error {
 }
 
 func userExists(field string, c *Context) error {
-	email := c.Query(field)
-	if email == "" {
-		c.Response.WriteHeader(400)
+	value := c.Query(field)
+	if value == "" {
+		c.String("No value", http.StatusBadRequest)
 		return nil
 	}
-	count, err := c.DB.Users.Find(bson.M{field: field}).Count()
+	count, err := c.DB.Users.Find(bson.M{field: value}).Count()
 	if err != nil {
 		return err
 	}

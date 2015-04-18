@@ -5,6 +5,8 @@ import (
 	"github.com/goincremental/negroni-sessions"
 	"github.com/julienschmidt/httprouter"
 	"gopkg.in/mgo.v2/bson"
+	"html/template"
+	"log"
 	"net/http"
 )
 
@@ -78,6 +80,11 @@ func (c *Context) GetUser() error {
 
 }
 
+func (c *Context) Login(user *User) {
+	session := c.GetSession()
+	session.Set("userid", user.Id.Hex())
+}
+
 func (c *Context) Query(name string) string {
 	return c.Request.URL.Query().Get(name)
 }
@@ -90,6 +97,29 @@ func (c *Context) JSON(payload interface{}, status int) error {
 	c.Response.Header().Set("Content-Type", "application/json")
 	c.Response.WriteHeader(status)
 	return json.NewEncoder(c.Response).Encode(payload)
+}
+
+func (c *Context) String(msg string, status int) {
+	c.Response.Header().Set("Content-Type", "text/plain")
+	c.Response.WriteHeader(status)
+	c.Response.Write([]byte(msg))
+}
+
+func (c *Context) Render(name string, ctx interface{}, status int) error {
+	t, err := template.ParseFiles(name)
+	if err != nil {
+		return err
+	}
+	return t.Execute(c.Response, ctx)
+}
+
+func (c *Context) Status(status int) {
+	c.String(http.StatusText(status), status)
+}
+
+func (c *Context) HandleError(err error) {
+	c.Status(http.StatusInternalServerError)
+	log.Print(err)
 }
 
 func (c *Context) GetSession() sessions.Session {
