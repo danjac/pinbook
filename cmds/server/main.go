@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	StaticDir  = "ui/public"
-	UploadsDir = "ui/uploads"
+	StaticDir  = "cmds/server/ui/public"
+	UploadsDir = "cmds/server/ui/uploads"
 )
 
 func getEnv(name string, defaultValue string) string {

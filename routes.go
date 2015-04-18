@@ -3,10 +3,10 @@ package pinbook
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/asaskevich/govalidator"
-	"github.com/gorilla/mux"
+	"github.com/julienschmidt/httprouter"
 	"github.com/justinas/nosurf"
 	"github.com/nfnt/resize"
+	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/mgo.v2/bson"
 	"html/template"
 	"image"
@@ -16,18 +16,10 @@ import (
 	"os"
 	"path"
 	"strconv"
-	"strings"
 	"time"
 )
 
 const PageSize = 6
-
-type PostForm struct {
-	Title   string `json:"title" valid:"required"`
-	URL     string `json:"url" valid:"url,required"`
-	Image   string `json:"image" valid:"image,required"`
-	Comment string `json:"comment" valid:"-"`
-}
 
 type Pagination struct {
 	Posts   []Post `json:"posts"`
@@ -55,37 +47,36 @@ func NewPagination(page int, total int) *Pagination {
 
 type handlerFunc func(*Context) error
 
-func makeHandler(app *App, h handlerFunc) http.HandlerFunc {
+func makeHandler(app *App, h handlerFunc, authRequired bool) httprouter.Handle {
 
-	return func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 
-		c := NewContext(app, w, r)
+		c := NewContext(app, w, r, ps)
+
+		if authRequired {
+			if err := c.GetUser(); err != nil {
+				panic(err)
+			}
+			if c.User == nil {
+				c.Response.WriteHeader(401)
+				return
+			}
+		}
 		err := h(c)
 		if err != nil {
 			// http error handling here...
-			panic(err)
-		}
-	}
-
-}
-
-func makeSecureHandler(app *App, h handlerFunc) http.HandlerFunc {
-
-	return func(w http.ResponseWriter, r *http.Request) {
-
-		c := NewContext(app, w, r)
-
-		err := c.GetUser()
-		if err != nil {
-			panic(err)
-		}
-		if c.User == nil {
-			http.Error(w, "You must be logged in", http.StatusUnauthorized)
-			return
-		}
-		err = h(c)
-		if err != nil {
-			panic(err)
+			switch e := err.(type) {
+			/*
+				case mgo.ErrNotFound:
+					http.NotFound(c.Response, c.Request)
+					return
+			*/
+			case *ErrorMap:
+				c.JSON(e.Errors, http.StatusBadRequest)
+				return
+			default:
+				panic(e)
+			}
 		}
 	}
 
@@ -124,7 +115,7 @@ func loginHandler(c *Context) error {
 		Password string `json:"password"`
 	}{}
 
-	if err := c.ParseJSON(s); err != nil {
+	if err := c.DecodeJSON(s); err != nil {
 		return err
 	}
 
@@ -136,16 +127,16 @@ func loginHandler(c *Context) error {
 	session := c.GetSession()
 	session.Set("userid", user.Id.Hex())
 
-	return c.RenderJSON(user, http.StatusOK)
+	return c.JSON(user, http.StatusOK)
 
 }
 
 func voteHandler(score int, c *Context) error {
 
-	query := []bson.M{
+	query := bson.M{"$and": []bson.M{
 		bson.M{"_id": c.GetObjectId("id")},
-		bson.M{"$not": bson.M{"author": c.User.Id}},
-		bson.M{"$not": bson.M{"$in": bson.M{"_id": c.User.Votes}}}}
+		bson.M{"author": bson.M{"$ne": c.User.Id}},
+		bson.M{"_id": bson.M{"$nin": c.User.Votes}}}}
 
 	post := &Post{}
 
@@ -161,7 +152,7 @@ func voteHandler(score int, c *Context) error {
 		return err
 	}
 
-	if err := c.DB.Users.UpdateId(c.User.Id, bson.M{"votes": append(c.User.Votes, post.Id)}); err != nil {
+	if err := c.DB.Users.UpdateId(c.User.Id, bson.M{"$set": bson.M{"votes": append(c.User.Votes, post.Id)}}); err != nil {
 		return err
 	}
 
@@ -174,7 +165,7 @@ func downvoteHandler(c *Context) error {
 }
 
 func upvoteHandler(c *Context) error {
-	return voteHandler(-1, c)
+	return voteHandler(1, c)
 }
 
 func deletePostHandler(c *Context) error {
@@ -203,13 +194,8 @@ func submitPostHandler(c *Context) error {
 
 	form := &PostForm{}
 
-	if err := c.ParseJSON(form); err != nil {
+	if err := c.Validate(form); err != nil {
 		return err
-	}
-
-	_, err := govalidator.ValidateStruct(form)
-	if err != nil {
-		return c.RenderJSON(err, 400)
 	}
 
 	// fetch image
@@ -282,7 +268,7 @@ func submitPostHandler(c *Context) error {
 		return err
 	}
 
-	return c.RenderJSON(post, http.StatusOK)
+	return c.JSON(post, http.StatusOK)
 }
 
 func userHandler(c *Context) error {
@@ -295,7 +281,7 @@ func userHandler(c *Context) error {
 
 	user := &Author{}
 
-	err := c.DB.Users.Find(bson.M{"name": c.Param("name")}).One(&user)
+	err := c.DB.Users.Find(bson.M{"name": c.Params.ByName("name")}).One(&user)
 
 	q := c.DB.Posts.Find(bson.M{"author": user.Id})
 
@@ -324,7 +310,62 @@ func userHandler(c *Context) error {
 		result.Posts = append(result.Posts, post)
 	}
 
-	return c.RenderJSON(result, http.StatusOK)
+	return c.JSON(result, http.StatusOK)
+
+}
+
+func userExists(field string, c *Context) error {
+	email := c.Query(field)
+	if email == "" {
+		c.Response.WriteHeader(400)
+		return nil
+	}
+	count, err := c.DB.Users.Find(bson.M{field: field}).Count()
+	if err != nil {
+		return err
+	}
+
+	payload := make(map[string]bool)
+	payload["exists"] = count > 0
+	return c.JSON(payload, http.StatusOK)
+}
+
+func emailExists(c *Context) error {
+	return userExists("email", c)
+}
+
+func nameExists(c *Context) error {
+	return userExists("name", c)
+}
+
+func signupHandler(c *Context) error {
+
+	form := &SignupForm{}
+	if err := c.Validate(form); err != nil {
+		return err
+	}
+
+	password, err := bcrypt.GenerateFromPassword([]byte(form.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+
+	user := &User{
+		Id:       bson.NewObjectId(),
+		Created:  time.Now(),
+		Name:     form.Name,
+		Email:    form.Email,
+		Password: string(password),
+	}
+
+	if err := c.DB.Users.Insert(user); err != nil {
+		return err
+	}
+
+	session := c.GetSession()
+	session.Set("userid", user.Id.Hex())
+
+	return c.JSON(user, http.StatusOK)
 
 }
 
@@ -371,7 +412,7 @@ func searchHandler(c *Context) error {
 		result.Posts = append(result.Posts, post)
 	}
 
-	return c.RenderJSON(result, http.StatusOK)
+	return c.JSON(result, http.StatusOK)
 
 }
 
@@ -413,75 +454,50 @@ func postsHandler(c *Context) error {
 		result.Posts = append(result.Posts, post)
 	}
 
-	return c.RenderJSON(result, http.StatusOK)
+	return c.JSON(result, http.StatusOK)
 }
 
-func serveStatic(router *mux.Router, prefix string, dirname string) {
-	router.PathPrefix(prefix).Handler(http.StripPrefix(prefix, http.FileServer(http.Dir(dirname))))
-}
+func getRouter(app *App) http.Handler {
 
-func addValidators(app *App) {
-	govalidator.TagMap["image"] = govalidator.Validator(func(str string) bool {
-		ext := strings.ToLower(path.Ext(str))
-		if ext == "" {
-			return false
-		}
-		for _, s := range []string{".png", ".jpg"} {
-			if s == ext {
-				return true
-			}
-		}
-		return false
-	})
-
-	govalidator.TagMap["uniqueEmail"] = govalidator.Validator(func(str string) bool {
-		if str == "" {
-			return true
-		}
-		num, _ := app.DB.Users.Find(bson.M{"email": str}).Count()
-		return num == 0
-	})
-
-	govalidator.TagMap["uniqueName"] = govalidator.Validator(func(str string) bool {
-		if str == "" {
-			return true
-		}
-		num, _ := app.DB.Users.Find(bson.M{"name": str}).Count()
-		return num == 0
-	})
-
-}
-
-func getRouter(app *App) *mux.Router {
-
-	router := mux.NewRouter()
+	router := httprouter.New()
 
 	// public api
 
-	api := router.PathPrefix("/api").Subrouter()
-	api.HandleFunc("/posts/", makeHandler(app, postsHandler)).Methods("GET")
-	api.HandleFunc("/search/", makeHandler(app, searchHandler)).Methods("GET")
-	api.HandleFunc("/user/{name}", makeHandler(app, userHandler)).Methods("GET")
-	api.HandleFunc("/login/", makeHandler(app, loginHandler)).Methods("POST")
+	router.GET("/api/posts/", makeHandler(app, postsHandler, false))
+	router.GET("/api/search/", makeHandler(app, searchHandler, false))
+	router.GET("/api/user/:name", makeHandler(app, userHandler, false))
+	router.POST("/api/login/", makeHandler(app, loginHandler, false))
 
 	// private api
 
-	secure := api.PathPrefix("/auth/").Subrouter()
-	secure.HandleFunc("/submit/", makeSecureHandler(app, submitPostHandler)).Methods("POST")
-	secure.HandleFunc("/downvote/{id}", makeSecureHandler(app, downvoteHandler)).Methods("PUT")
-	secure.HandleFunc("/upvote/{id}", makeSecureHandler(app, upvoteHandler)).Methods("PUT")
-	secure.HandleFunc("/{id}", makeSecureHandler(app, deletePostHandler)).Methods("DELETE")
+	router.POST("/api/auth/submit/", makeHandler(app, submitPostHandler, true))
+	router.PUT("/api/auth/downvote/:id", makeHandler(app, downvoteHandler, true))
+	router.PUT("/api/auth//upvote/:id", makeHandler(app, upvoteHandler, true))
+	router.DELETE("/api/auth/:id", makeHandler(app, deletePostHandler, true))
 
-	// public files
+	// static files
 
-	serveStatic(router, "/static/", app.Cfg.StaticDir)
-	serveStatic(router, "/uploads/", app.Cfg.UploadsDir)
+	router.ServeFiles("/static/*filepath", http.Dir(app.Cfg.StaticDir))
+	router.ServeFiles("/uploads/*filepath", http.Dir(app.Cfg.UploadsDir))
 
-	// main page
+	// main pages
 
-	main := router.PathPrefix("/").Subrouter()
-	main.HandleFunc("/logout/", makeHandler(app, logoutHandler)).Methods("GET")
-	main.HandleFunc(`/{rest:[a-zA-Z0-9=\-\/]*}`, makeHandler(app, indexPageHandler)).Methods("GET")
+	router.GET("/logout/", makeHandler(app, logoutHandler, false))
+
+	indexPage := makeHandler(app, indexPageHandler, false)
+
+	mainRoutes := []string{
+		"/",
+		"/login",
+		"/search",
+		"/latest",
+		"/user/:name",
+		"/submit",
+	}
+
+	for _, route := range mainRoutes {
+		router.GET(route, indexPage)
+	}
 
 	return router
 
