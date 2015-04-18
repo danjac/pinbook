@@ -84,9 +84,8 @@ func makeHandler(app *App, h handlerFunc, authRequired bool) httprouter.Handle {
 }
 
 func logoutHandler(c *Context) error {
-	session := c.GetSession()
-	session.Clear()
-	http.Redirect(c.Response, c.Request, "/", http.StatusSeeOther)
+	c.Logout()
+	c.Redirect("/")
 	return nil
 }
 

@@ -85,6 +85,15 @@ func (c *Context) Login(user *User) {
 	session.Set("userid", user.Id.Hex())
 }
 
+func (c *Context) Logout() {
+	session := c.GetSession()
+	session.Clear()
+}
+
+func (c *Context) Redirect(url string) {
+	http.Redirect(c.Response, c.Request, url, http.StatusSeeOther)
+}
+
 func (c *Context) Query(name string) string {
 	return c.Request.URL.Query().Get(name)
 }
