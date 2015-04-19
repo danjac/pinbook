@@ -12,6 +12,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"log"
 	"net/http"
 	"os"
 	"path"
@@ -172,9 +173,11 @@ func deletePostHandler(c *Context) error {
 		return nil
 	}
 
-	if err := os.Remove(path.Join(c.Cfg.UploadsDir, post.Image)); err != nil {
-		return err
-	}
+	go func() {
+		if err := os.Remove(path.Join(c.Cfg.UploadsDir, post.Image)); err != nil {
+			log.Print(err)
+		}
+	}()
 
 	if err := c.DB.Posts.Remove(query); err != nil {
 		return err
